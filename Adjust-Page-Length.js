@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         ·ÉÊéÒ³Ãæ¸ß¶Èµ÷ÕûÆ÷
+// @name         é£ä¹¦é¡µé¢é«˜åº¦è°ƒæ•´å™¨
 // @namespace    http://tampermonkey.net/
 // @version      1.0
-// @description  ÔÚ·ÉÊéÒ³ÃæÓÒÉÏ½ÇÌí¼Ó¸¡´°°´Å¥£¬µã»÷ºóµ÷ÕûÒ³Ãæ¸ß¶È²¢ÏÔÊ¾³É¹¦ÌáÊ¾
+// @description  åœ¨é£ä¹¦é¡µé¢å³ä¸Šè§’æ·»åŠ æµ®çª—æŒ‰é’®ï¼Œç‚¹å‡»åè°ƒæ•´é¡µé¢é«˜åº¦å¹¶æ˜¾ç¤ºæˆåŠŸæç¤º
 // @author       You
 // @match        https://*.feishu.cn/*
 // @match        https://*.larkoffice.com/*
@@ -12,11 +12,11 @@
 (function() {
     'use strict';
 
-    // ´´½¨¸¡´°°´Å¥
+    // åˆ›å»ºæµ®çª—æŒ‰é’®
     const floatButton = document.createElement('div');
     floatButton.innerHTML = '??';
 
-    // ÉèÖÃ°´Å¥ÑùÊ½
+    // è®¾ç½®æŒ‰é’®æ ·å¼
     floatButton.style.cssText = `
         position: fixed;
         top: 70px;
@@ -37,10 +37,10 @@
         user-select: none;
     `;
 
-    // ´´½¨³É¹¦ÌáÊ¾µ¯´°
+    // åˆ›å»ºæˆåŠŸæç¤ºå¼¹çª—
     function showSuccessToast() {
         const toast = document.createElement('div');
-        toast.innerHTML = '? µ÷ÕûÒ³Ãæ¸ß¶È³É¹¦';
+        toast.innerHTML = '? è°ƒæ•´é¡µé¢é«˜åº¦æˆåŠŸ';
 
         toast.style.cssText = `
             position: fixed;
@@ -62,13 +62,13 @@
 
         document.body.appendChild(toast);
 
-        // ÏÔÊ¾¶¯»­
+        // æ˜¾ç¤ºåŠ¨ç”»
         setTimeout(() => {
             toast.style.opacity = '1';
             toast.style.transform = 'translateX(0)';
         }, 10);
 
-        // 3Ãëºó×Ô¶¯ÏûÊ§
+        // 3ç§’åè‡ªåŠ¨æ¶ˆå¤±
         setTimeout(() => {
             toast.style.opacity = '0';
             toast.style.transform = 'translateX(100%)';
@@ -80,7 +80,7 @@
         }, 3000);
     }
 
-    // Ìí¼ÓĞüÍ£Ğ§¹û
+    // æ·»åŠ æ‚¬åœæ•ˆæœ
     floatButton.addEventListener('mouseenter', function() {
         this.style.transform = 'scale(1.1)';
         this.style.boxShadow = '0 4px 15px rgba(0,0,0,0.4)';
@@ -91,25 +91,25 @@
         this.style.boxShadow = '0 2px 10px rgba(0,0,0,0.3)';
     });
 
-    // Ìí¼Óµã»÷ÊÂ¼ş
+    // æ·»åŠ ç‚¹å‡»äº‹ä»¶
     floatButton.addEventListener('click', function() {
-        // Ö´ĞĞÖ¸¶¨µÄJavaScript´úÂë
+        // æ‰§è¡ŒæŒ‡å®šçš„JavaScriptä»£ç 
         window.innerHeight = 9e9;
 
-        // Ìí¼Óµã»÷·´À¡
+        // æ·»åŠ ç‚¹å‡»åé¦ˆ
         this.style.backgroundColor = '#34a853';
         setTimeout(() => {
             this.style.backgroundColor = '#4285f4';
         }, 200);
 
-        // ÏÔÊ¾³É¹¦ÌáÊ¾
+        // æ˜¾ç¤ºæˆåŠŸæç¤º
         showSuccessToast();
     });
 
-    // ½«°´Å¥Ìí¼Óµ½Ò³Ãæ
+    // å°†æŒ‰é’®æ·»åŠ åˆ°é¡µé¢
     document.body.appendChild(floatButton);
 
-    // Ìí¼ÓÌáÊ¾ÎÄ±¾
-    floatButton.title = 'µã»÷µ÷ÕûÒ³Ãæ¸ß¶È';
+    // æ·»åŠ æç¤ºæ–‡æœ¬
+    floatButton.title = 'ç‚¹å‡»è°ƒæ•´é¡µé¢é«˜åº¦';
 
 })();
