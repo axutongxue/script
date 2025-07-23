@@ -14,7 +14,7 @@
 
     // 创建浮窗按钮
     const floatButton = document.createElement('div');
-    floatButton.innerHTML = '??';
+    floatButton.innerHTML = '📏';
 
     // 设置按钮样式
     floatButton.style.cssText = `
@@ -40,7 +40,7 @@
     // 创建成功提示弹窗
     function showSuccessToast() {
         const toast = document.createElement('div');
-        toast.innerHTML = '? 调整页面高度成功';
+        toast.innerHTML = '✅ 调整页面高度成功';
 
         toast.style.cssText = `
             position: fixed;
