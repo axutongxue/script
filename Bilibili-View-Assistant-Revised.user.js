@@ -2,13 +2,14 @@
 // @name               Bilibili B 站浏览助手-改
 // @name:zh-CN         Bilibili B 站浏览助手-改
 // @name:en            Bilibili Enhancer Tools (Danmaku Edition)
-// @description        增强功能：查看封面、下载字幕(SRT/TXT)、下载弹幕(XML/ASS)、下载评论、下载视频(支持 4K/8K)、AI 总结字幕、素材酷平台视频下载、用户空间批量下载、个人收藏批量下载。
-// @description:zh-CN  增强功能：查看封面、下载字幕(SRT/TXT)、下载弹幕(XML/ASS)、下载评论、下载视频(支持 4K/8K)、AI 总结字幕、素材酷平台视频下载、用户空间批量下载、个人收藏批量下载。
-// @description:en     Enhanced Features: View Cover, Download Subtitles(SRT/TXT), Download Danmaku(XML/ASS), Download Comments, Download Video(4K、8K Support), AI Subtitle Summary, Cool Video Download, User Space Batch Download, Personal Favorites Batch Download.
+// @description        增强功能：查看封面、下载字幕(SRT/TXT)、下载弹幕(XML/ASS)、下载评论、下载视频(支持 4K/8K)、视频截图、AI 总结字幕、素材库平台视频下载、用户空间批量下载、个人收藏批量下载。
+// @description:zh-CN  增强功能：查看封面、下载字幕(SRT/TXT)、下载弹幕(XML/ASS)、下载评论、下载视频(支持 4K/8K)、视频截图、AI 总结字幕、素材库平台视频下载、用户空间批量下载、个人收藏批量下载。
+// @description:en     Enhanced Features: View Cover, Download Subtitles(SRT/TXT), Download Danmaku(XML/ASS), Download Comments, Download Video(4K、8K Support), Video Screenshot, AI Subtitle Summary, Cool Video Download, User Space Batch Download, Personal Favorites Batch Download.
 // @namespace          https://www.runningcheese.com/userscripts
-// @author             RunningCheese
-// @version            3.9
+// @author             阿虚同学（原作者：RunningCheese）
+// @version            3.15
 // @match              http*://www.bilibili.com/video/*
+// @match              http*://www.bilibili.com/bangumi/*
 // @match              http*://www.bilibili.com/list/*
 // @match              http*://space.bilibili.com/*
 // @match              https://cool.bilibili.com/detail/video?*
@@ -257,7 +258,7 @@
             return element;
         },
         getAs(selector) {
-            return document.body.querySelector(selector);
+            return document.body ? document.body.querySelector(selector) : null;
         }
     };
 
@@ -434,12 +435,87 @@
         ].join('\n');
     }
 
-    async function downloadDanmaku(format) {
+    // 通过 epid 调 B 站 API 查 cid（番剧页终极兜底）
+    // 已验证 ep18915：cid 在 result.play_view_business_info.episode_info.cid
+    function fetchCidByEpid(epid) {
+        return new Promise(function(resolve, reject) {
+            if (!epid) { reject(new Error('缺少 epid')); return; }
+            var url = 'https://api.bilibili.com/pgc/player/web/v2/playurl?ep_id=' + encodeURIComponent(String(epid)) + '&qn=16&fnval=4048&fourk=1';
+            var onDone = function(json) {
+                try {
+                    if (json && json.code !== 0) { reject(new Error('API code=' + json.code)); return; }
+                    // 番剧 playurl 返回结构：result.play_view_business_info.episode_info.cid
+                    var info = json && json.result && json.result.play_view_business_info && json.result.play_view_business_info.episode_info;
+                    var c = info && info.cid;
+                    // 兼容旧版 data.cid / data.dash.cid
+                    if (!c && json && json.data) {
+                        c = json.data.cid || (json.data.dash && json.data.dash.cid);
+                    }
+                    if (c) resolve(c); else reject(new Error('API 未返回 cid'));
+                } catch (e) { reject(e); }
+            };
+            if (typeof GM_xmlhttpRequest === 'function') {
+                GM_xmlhttpRequest({
+                    method: 'GET', url: url, timeout: 15000, responseType: 'json',
+                    onload: function(resp) { try { onDone(JSON.parse(resp.responseText || '{}')); } catch (e) { reject(e); } },
+                    onerror: function() { reject(new Error('网络请求失败')); },
+                    ontimeout: function() { reject(new Error('请求超时')); }
+                });
+            } else {
+                fetch(url, { credentials: 'include' }).then(function(r) { return r.json(); }).then(onDone, reject);
+            }
+        });
+    }
+
+    // 从 URL 解析当前番剧 epid
+    function parseEpidFromUrl() {
+        var m = location.pathname.match(/ep(\d+)/i) || location.search.match(/[?&]ep_id=(\d+)/i);
+        return m ? m[1] : null;
+    }
+
+    // 综合取 cid（视频页 + 番剧页），弹幕下载专用，不依赖 bilibiliViewer 内部状态
+    async function resolveCidForDanmaku() {
+        // 1. 已缓存的 bilibiliViewer.cid
         var cid = bilibiliViewer.cid;
-        if (!cid) {
-            var st = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).__INITIAL_STATE__;
-            cid = st && st.videoData && st.videoData.cid;
+        if (cid) return cid;
+        // 2. 调用 getEpInfo() 尝试补 cid
+        if (typeof bilibiliViewer.getEpInfo === 'function') {
+            try { cid = bilibiliViewer.getEpInfo(); } catch (e) {}
+            if (cid) return cid;
         }
+        // 3. __INITIAL_STATE__ 多路兜底
+        var st = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).__INITIAL_STATE__ || window.__INITIAL_STATE__;
+        if (st) {
+            cid = st.videoData && st.videoData.cid;
+            if (cid) return cid;
+            if (st.epInfo) {
+                cid = st.epInfo.cid;
+                if (!cid && Array.isArray(st.epInfo.cids) && st.epInfo.cids.length) {
+                    var p = st.p || st.epInfo.p || 0;
+                    cid = st.epInfo.cids[p] || st.epInfo.cids[0];
+                }
+                if (cid) return cid;
+                // mediaInfo.episodes 按 ep_id 匹配
+                var eps = (st.epInfo.mediaInfo && st.epInfo.mediaInfo.episodes) || (st.mediaInfo && st.mediaInfo.episodes);
+                if (Array.isArray(eps) && eps.length) {
+                    var eid = st.epInfo.id || st.ep_id || st.epInfo.ep_id;
+                    var ep = eid ? eps.find(function(e) { return e && (e.id === eid || e.ep_id === eid); }) : null;
+                    cid = (ep && ep.cid) || (eps[0] && eps[0].cid);
+                    if (cid) return cid;
+                }
+            }
+        }
+        // 4. 番剧页终极兜底：用 URL 里的 epid 调 API 查 cid
+        var epid = (st && st.epInfo && (st.epInfo.id || st.epInfo.ep_id)) || parseEpidFromUrl();
+        if (epid) {
+            try { cid = await fetchCidByEpid(epid); } catch (e) { console.warn('[弹幕] fetchCidByEpid 失败', e); }
+            if (cid) return cid;
+        }
+        return null;
+    }
+
+    async function downloadDanmaku(format) {
+        var cid = await resolveCidForDanmaku();
         if (!cid) { showToast('未获取到 cid，请先点击字幕按钮加载视频信息', 3000); return; }
         showToast('正在获取弹幕…', 2000);
         try {
@@ -916,14 +992,14 @@
         }
     };
 
-    // 标题栏右侧（? 关闭符号）
+    // 标题栏右侧（✕ 关闭符号）
     const headerRight = elements.createAs("div", {
         style: `display: flex; align-items: center; gap: 6px;`
     }, subtitleHeader);
 
-    // ? 关闭符号
+    // ✕ 关闭符号
     const closeSymbol = elements.createAs("span", {
-        textContent: "?",
+        textContent: "✕",
         style: `cursor:pointer;color:#666;width:20px;height:20px;display:flex;align-items:center;justify-content:center;border-radius:50%;font-size:14px;transition:all 0.2s ease;flex-shrink:0;border:none;background:none;`,
     }, headerRight);
     closeSymbol.onmouseover = function() { this.style.background = '#dadada'; };
@@ -964,7 +1040,7 @@
         style: `flex:1;margin:0 4px;position:relative;`
     }, bottomBar);
     const aiSummaryBtn = elements.createAs("button", {
-        textContent: "AI 总结 ?",
+        textContent: "AI 总结 ▾",
         className: 'sub-btn',
     }, aiWrap);
     // AI 弹出菜单
@@ -1015,7 +1091,7 @@
             label.textContent = cp.text;
             opt.appendChild(label);
             var delBtn = document.createElement('span');
-            delBtn.textContent = '?';
+            delBtn.textContent = '✕';
             delBtn.style.cssText = 'color:#999;cursor:pointer;padding:0 2px;font-size:12px;flex-shrink:0;';
             delBtn.onmouseover = function() { this.style.color = '#e00'; };
             delBtn.onmouseout = function() { this.style.color = '#999'; };
@@ -1109,7 +1185,7 @@
         style: `flex:1;margin:0 4px;position:relative;`
     }, bottomBar);
     const downloadBtn = elements.createAs("button", {
-        textContent: "下载 ?",
+        textContent: "下载 ▾",
         className: 'sub-btn',
     }, dlWrap);
     // 下载弹出菜单
@@ -1218,7 +1294,6 @@
                 height: 18px;
                 border-radius: 4px;
                 cursor: pointer;
-                margin-left: 10px;
                 transition: background-color 0.3s, transform 0.2s;
                 flex-shrink: 0;
                 color: white;
@@ -1236,6 +1311,9 @@
             .bili-icon-btn:hover svg {
                 fill: white;
             }
+            /* 浮窗容器：竖排（固定，播放器左侧） */
+            #bili-viewer-floatbar { flex-direction: column !important; gap: 8px; }
+            #bili-viewer-floatbar .bili-icon-btn { margin: 0; }
 
             #subtitle-panel button:hover {
                 opacity: 0.9;
@@ -1259,6 +1337,64 @@
         buttonAdded: false,
         buttonCheckInterval: null,
 
+        // ═══ Tampermonkey 菜单按钮开关 ═══
+        // 按钮开关表：id=按钮 DOM id，label=菜单显示名，gmKey=GM 存储键名，默认全部开启
+        _btnSwitches: [
+            { id: 'cover-viewer-btn',   label: '封面按钮',     gmKey: 'bili_sw_cover' },
+            { id: 'subtitle-viewer-btn',label: '字幕按钮',     gmKey: 'bili_sw_subtitle' },
+            { id: 'copy-subtitle-btn',  label: '复制字幕按钮', gmKey: 'bili_sw_copy' },
+            { id: 'download-video-btn', label: '下载视频按钮', gmKey: 'bili_sw_download' },
+            { id: 'screenshot-btn',     label: '截图按钮',     gmKey: 'bili_sw_screenshot' },
+            { id: 'subtitle-mask-btn',  label: '字幕遮挡按钮', gmKey: 'bili_sw_mask' },
+        ],
+        // 创建/刷新 Tampermonkey 菜单项（每个按钮一项），点击切换状态
+        setupBtnSwitchMenus() {
+            if (typeof GM_registerMenuCommand !== 'function') return;
+            this._btnSwitches.forEach(sw => {
+                // 默认 1=开，未存档视为开
+                const enabled = GM_getValue(sw.gmKey, 1) !== 0;
+                GM_registerMenuCommand((enabled ? '[✔️已启用] ' : '[❌已禁用] ') + sw.label, function() {
+                    GM_setValue(sw.gmKey, enabled ? 0 : 1);
+                    alert('已' + (enabled ? '禁用' : '启用') + '「' + sw.label + '」，刷新页面后生效');
+                });
+            });
+            // 浮窗位置：播放器左侧 / 右侧（即时生效，无需刷新）
+            // 默认 0=左侧，1=右侧
+            const isRight = (typeof GM_getValue === 'function') && GM_getValue('bili_floatbar_rightside', 0) !== 0;
+            GM_registerMenuCommand((isRight ? '[右侧] ' : '[左侧] ') + '功能按钮位置', () => {
+                const cur = (typeof GM_getValue === 'function') && GM_getValue('bili_floatbar_rightside', 0) !== 0;
+                const next = cur ? 0 : 1;
+                GM_setValue('bili_floatbar_rightside', next);
+                // 即时移动浮窗（下一帧 rAF 也会重算，这里立即给视觉反馈）
+                const bar = document.getElementById('bili-viewer-floatbar');
+                if (bar) {
+                    const player = document.querySelector('#bilibili-player')
+                        || document.querySelector('.bpx-player-container')
+                        || document.querySelector('.player-wrap');
+                    if (player) {
+                        const rect = player.getBoundingClientRect();
+                        if (next !== 0) {
+                            bar.style.left = (rect.right + 8) + 'px';
+                        } else {
+                            bar.style.left = (rect.left - bar.offsetWidth - 8) + 'px';
+                        }
+                        bar.style.top = rect.top + 'px';
+                    }
+                }
+                showToast(next !== 0 ? '已切换到播放器右侧' : '已切换到播放器左侧', 1500);
+            });
+        },
+        // 根据开关状态隐藏浮窗里对应按钮
+        applyBtnSwitches() {
+            if (typeof GM_getValue !== 'function') return;
+            this._btnSwitches.forEach(sw => {
+                const btn = document.getElementById(sw.id);
+                if (!btn) return;
+                const enabled = GM_getValue(sw.gmKey, 1) !== 0;
+                btn.style.display = enabled ? '' : 'none';
+            });
+        },
+
         toast(msg, error) {
             if (error) console.error(msg, error);
             if (!this.toastDiv) {
@@ -1277,10 +1413,25 @@
 
         getSubtitle(lan, name) {
             const item = this.getSubtitleInfo(lan, name);
-            if (!item) throw('找不到所选语言字幕' + lan);
+            if (!item) throw('找不到所选语言字幕:' + lan);
 
-            return fetch(item.subtitle_url)
-                .then(res => res.json());
+            const url = item.subtitle_url;
+            return fetch(url).then(res => res.text()).then(text => {
+                if (!text || !text.trim()) {
+                    // 空响应通常是 subtitle_url 中的 auth_key 已过期
+                    // 清除缓存，下次会重新 setupData() 获取新 URL
+                    this.subtitle = null;
+                    this.pcid = null;
+                    throw('字幕内容为空(链接可能已过期)，请重新点击获取字幕');
+                }
+                try {
+                    return JSON.parse(text);
+                } catch (e) {
+                    this.subtitle = null;
+                    this.pcid = null;
+                    throw('字幕JSON解析失败:' + e.message + ' (URL:' + url.slice(0, 80) + ')');
+                }
+            });
         },
 
         getSubtitleInfo(lan, name) {
@@ -1343,7 +1494,10 @@
         },
 
         async setupData() {
-            if (this.subtitle && (this.pcid == this.getEpInfo())) return this.subtitle;
+            // 防止误缓存命中: pcid 必须非空且严格相等于 getEpInfo() 才用缓存
+            // （reset() 已将 this.subtitle=null + this.pcid=null，但 undefined==undefined 误判场景用 === 排除）
+            const epData = this.getEpInfo();
+            if (this.subtitle && this.pcid != null && this.pcid === epData) return this.subtitle;
 
             if (location.pathname == '/blackboard/html5player.html') {
                 let match = location.search.match(/cid=(\d+)/i);
@@ -1351,7 +1505,7 @@
                 this.window.cid = match[1];
                 match = location.search.match(/aid=(\d+)/i);
                 if (match) this.window.aid = match[1];
-                match = location.search.match(/bvid=(\d+)/i);
+                match = location.search.match(/bvid=(BV[\w]+)/i);
                 if (match) this.window.bvid = match[1];
             }
 
@@ -1378,6 +1532,8 @@
                         if (ret.code != 0 || !ret.data || !ret.data.subtitle) throw('读取视频字幕配置错误:' + ret.code + ret.message);
                         this.subtitle = ret.data.subtitle;
                         this.subtitle.count = this.subtitle.subtitles.length;
+                        // 主分支也需对 subtitle_url 做协议规范化(只在 fallback 分支做了)
+                        this.subtitle.subtitles.forEach(item => item.subtitle_url && (item.subtitle_url = item.subtitle_url.replace(/^https?:\/\//, '//')));
                         return this.subtitle;
                     });
                 } else {
@@ -1414,19 +1570,25 @@
             }
         },
 
-        // 添加字幕和封面按钮到固定浮窗（跟踪 .video-info-detail-list 位置）
+        // 添加字幕和封面按钮到固定浮窗（竖排贴播放器左侧）
+        // 浮窗按钮：封面、字幕、复制字幕、下载视频、截图、字幕遮挡
+        // 复制字幕/下载视频仅视频路径；封面/字幕/截图/字幕遮挡所有路径都有
         addButtons() {
-            // 如果按钮已添加，则不重复添加
-            if (elements.getAs('#subtitle-viewer-btn') && elements.getAs('#cover-viewer-btn') && elements.getAs('#download-video-btn')) {
-                return;
-            }
+            const isVideoPath = location.pathname.startsWith('/video/') ||
+                                location.pathname.startsWith('/list/watchlater');
+            const needCopyAndDlBtn = isVideoPath; // 复制字幕、下载视频仅视频路径显示
+            // 按钮集合已齐备则不重复加（按路径需求逐项判断）
+            const baseReady = elements.getAs('#subtitle-viewer-btn') && elements.getAs('#cover-viewer-btn') && elements.getAs('#screenshot-btn') && elements.getAs('#subtitle-mask-btn')
+                && (!needCopyAndDlBtn || (elements.getAs('#download-video-btn') && elements.getAs('#copy-subtitle-btn')));
+            if (baseReady) return;
 
             // 创建固定浮窗容器，挂在 document.body 下，不碰 Vue 管辖元素
+            if (!document.body) return;
             let floatBar = document.getElementById('bili-viewer-floatbar');
             if (!floatBar) {
                 floatBar = document.createElement('div');
                 floatBar.id = 'bili-viewer-floatbar';
-                floatBar.style.cssText = 'position: fixed; z-index: 9999; display: none; align-items: center; gap: 6px;';
+                floatBar.style.cssText = 'position: fixed; z-index: 9999; display: none; flex-direction: column; gap: 8px;';
                 document.body.appendChild(floatBar);
             }
 
@@ -1453,8 +1615,19 @@
                 }, floatBar);
             }
 
-            // 创建下载视频按钮
-            if (!elements.getAs('#download-video-btn')) {
+            // 创建复制字幕按钮（仅视频路径，番剧不显示）
+            if (needCopyAndDlBtn && !elements.getAs('#copy-subtitle-btn')) {
+                const copyBtn = elements.createAs('a', {
+                    id: 'copy-subtitle-btn',
+                    className: 'bili-icon-btn',
+                    title: '复制字幕\n点击直接复制字幕文本到剪贴板',
+                    innerHTML: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/><path d="M9.5 1H6a1 1 0 0 0-1 1v1a1 1 0 0 0 1 1h3.5a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1zM6 0h3.5a2 2 0 0 1 2 2v1a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V2a2 2 0 0 1 2-2z"/><path d="M4 7.5a.5.5 0 0 1 .5-.5h7a.5.5 0 0 1 0 1h-7a.5.5 0 0 1-.5-.5zm0 2a.5.5 0 0 1 .5-.5h7a.5.5 0 0 1 0 1h-7a.5.5 0 0 1-.5-.5zm0 2a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1-.5-.5z"/></svg>',
+                    onclick: (e) => { e.stopPropagation(); this.copySubtitleText(); }
+                }, floatBar);
+            }
+
+            // 创建下载视频按钮（仅视频路径，番剧不显示）
+            if (needCopyAndDlBtn && !elements.getAs('#download-video-btn')) {
                 const downloadBtn = elements.createAs('a', {
                     id: 'download-video-btn',
                     className: 'bili-icon-btn',
@@ -1482,6 +1655,31 @@
                 }, floatBar);
             }
 
+            // 创建截图按钮（所有路径都走浮窗，番剧不再注入控制栏）
+            if (!elements.getAs('#screenshot-btn')) {
+                const shotBtn = elements.createAs('a', {
+                    id: 'screenshot-btn',
+                    className: 'bili-icon-btn',
+                    title: '视频截图',
+                    innerHTML: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"><g fill="white"><rect x="2" y="7" width="20" height="13" rx="2"/><rect x="8" y="4" width="8" height="4.5"/></g><circle cx="12" cy="13" r="3.5" fill="#39ADE7"/></svg>',
+                    onclick: (e) => { e.stopPropagation(); this.takeScreenshot(); }
+                }, floatBar);
+            }
+
+            // 创建字幕遮挡工具按钮（所有路径）
+            if (!elements.getAs('#subtitle-mask-btn')) {
+                const maskBtn = elements.createAs('a', {
+                    id: 'subtitle-mask-btn',
+                    className: 'bili-icon-btn',
+                    title: '字幕遮挡工具\n点击切换显示/隐藏遮挡框\n拖拽遮挡框可移动，右下角可缩放',
+                    innerHTML: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"><path fill="white" d="M3 5h18v4H3V5zm0 6h11v8H3v-8zm13 0h5v8h-5v-8z"/></svg>',
+                    onclick: (e) => { e.stopPropagation(); this.toggleSubtitleMask(); }
+                }, floatBar);
+            }
+
+            // 应用按钮开关状态（通过 Tampermonkey 菜单配置，未开启则隐藏）
+            this.applyBtnSwitches();
+
             this.buttonAdded = true;
             this.startFloatBarTracking();
             console.log('B站字幕、封面查看和下载按钮已添加到浮动浮窗（跟踪详情行位置）');
@@ -1489,48 +1687,58 @@
 
         // 启动浮动浮窗位置跟踪，跟随 .video-info-detail-list 末尾
         startFloatBarTracking() {
+            // 取消可能存在的旧 rAF 循环（SPA 跳转后 addButtons 会重新启动新的）
+            if (this._trackRafId) cancelAnimationFrame(this._trackRafId);
             let lastUrl = location.href;
-            let rafId = null;
 
             const update = () => {
                 const floatBar = document.getElementById('bili-viewer-floatbar');
                 if (!floatBar) {
-                    rafId = requestAnimationFrame(update);
+                    this._trackRafId = requestAnimationFrame(update);
                     return;
                 }
 
                 // SPA 路由变化时停止旧跟踪（addButtons 会重新启动）
                 if (location.href !== lastUrl) {
-                    if (rafId) cancelAnimationFrame(rafId);
+                    if (this._trackRafId) cancelAnimationFrame(this._trackRafId);
+                    this._trackRafId = null;
                     floatBar.style.display = 'none';
                     return;
                 }
 
-                const detailList = document.querySelector('.video-info-detail-list.video-info-detail-content');
-                if (!detailList) {
+                // 竖排固定：锚定播放器（贴近播放器左边缘外侧，靠上对齐）
+                const anchor = document.querySelector('#bilibili-player')
+                      || document.querySelector('.bpx-player-container')
+                      || document.querySelector('.player-wrap');
+                if (!anchor) {
                     floatBar.style.display = 'none';
-                    rafId = requestAnimationFrame(update);
+                    this._trackRafId = requestAnimationFrame(update);
                     return;
                 }
 
-                const rect = detailList.getBoundingClientRect();
+                const rect = anchor.getBoundingClientRect();
 
                 // 目标在视口内才显示
                 if (rect.bottom < 0 || rect.top > window.innerHeight) {
                     floatBar.style.display = 'none';
-                    rafId = requestAnimationFrame(update);
+                    this._trackRafId = requestAnimationFrame(update);
                     return;
                 }
 
-                // 定位到详情行右侧，垂直居中对齐
                 floatBar.style.display = 'flex';
-                floatBar.style.left = (rect.right - floatBar.offsetWidth) + 'px';
-                floatBar.style.top = (rect.top + (rect.height - floatBar.offsetHeight) / 2) + 'px';
+                // 播放器左侧或右侧（由菜单「功能按钮位置」控制）：左侧紧贴无间隙，右侧留 8px，顶部与播放器顶边对齐
+                const isRight = (typeof GM_getValue === 'function') && GM_getValue('bili_floatbar_rightside', 0) !== 0;
+                if (isRight) {
+                    floatBar.style.left = (rect.right + 8) + 'px';
+                } else {
+                    floatBar.style.left = (rect.left - floatBar.offsetWidth - 8) + 'px';
+                }
+                floatBar.style.top = (rect.top) + 'px';
 
-                rafId = requestAnimationFrame(update);
+                this._trackRafId = requestAnimationFrame(update);
             };
 
-            rafId = requestAnimationFrame(update);
+            this._trackRafId = requestAnimationFrame(update);
         },
 
            // 在面板中显示字幕
@@ -1548,7 +1756,7 @@
         opt.value = '';
         opt.textContent = '无字幕';
         select.appendChild(opt);
-        subtitleContent.textContent = '当前无字幕，但可提取评论...';
+        subtitleContent.innerHTML = '当前视频无AI字幕，可以下载视频后使用一键本地视频转文字工具，将转写的 txt 文件扔给AI大模型总结：<a href="https://mp.weixin.qq.com/s/MG91O-vX0x2BvfsSCFJWSA" target="_blank" contenteditable="false" style="color:#39ADE7;text-decoration:underline;cursor:pointer;">查看教程</a>';
         return;
     }
     this.subtitle.subtitles.forEach(sub => {
@@ -1640,6 +1848,197 @@
             }
         },
 
+        // 截取当前视频画面
+        takeScreenshot() {
+            const video = document.querySelector('video');
+            if (!video || video.videoWidth === 0) {
+                this.toast('未找到视频或视频未播放');
+                return;
+            }
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+
+            const pad = (n, l) => n.toString().padStart(l, '0');
+            const now = video.currentTime;
+            const timeStr = `${pad(Math.floor(now / 3600))}_${pad(Math.floor((now % 3600) / 60))}_${pad(Math.floor(now % 60))}_${pad(Math.floor((now * 1000) % 1000), 3)}`;
+            const bvId = location.pathname.match(/(BV\w+)|(av\d+)/)?.[0] || 'Unknown';
+            const res = `${canvas.width}x${canvas.height}`;
+            const title = (document.querySelector('.video-title')?.title
+                || document.querySelector('h1')?.innerText
+                || document.title || 'screenshot')
+                .replace(/_哔哩哔哩.*$/, '').trim()
+                .replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, '_');
+            const filename = `${title}_${timeStr}_${bvId}_${res}.png`;
+
+            canvas.toBlob(blob => {
+                if (!blob) { this.toast('截图失败'); return; }
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+                this.toast('截图已保存');
+            }, 'image/png');
+        },
+
+        // 复制字幕文本到剪贴板（无数据时自动拉取，成功必有提示）
+        copySubtitleText() {
+            // 优先用面板已加载的字幕文本
+            const subtitleContentEl = document.getElementById('subtitle-content');
+            const panelText = subtitleContentEl ? subtitleContentEl.textContent : '';
+            const isPlaceholder = !panelText || panelText === '正在加载字幕...' || panelText.startsWith('当前视频无AI字幕') || panelText.startsWith('获取字幕失败');
+            const cachedText = (!isPlaceholder && panelText) ? panelText : (_lastSubBody ? _lastSubBody.map(item => (item.content || '').split('\n')[0].trim() + '，').join('\r\n') : '');
+
+            if (cachedText) {
+                this._copyTextToClipboard(cachedText, '字幕已复制到剪贴板');
+                return;
+            }
+
+            // 没有缓存数据，自动拉取字幕
+            // showToast 不依赖 B站播放器 toast 容器，比 this.toast 可靠
+            showToast('正在获取字幕…', 1500);
+            this.setupData().then(subtitle => {
+                if (!subtitle || subtitle.count === 0) {
+                    showToast('当前视频无AI字幕', 2000);
+                    return;
+                }
+                // 选默认语言：简中 > 繁中 > 其他中文 > 第一个
+                const preferred = subtitle.subtitles.find(s => s.lan === 'zh-CN' || s.lan === 'zh-Hans')
+                    || subtitle.subtitles.find(s => s.lan === 'zh-TW' || s.lan === 'zh-Hant')
+                    || subtitle.subtitles.find(s => /^zh/i.test(s.lan))
+                    || subtitle.subtitles[0];
+                return this.getSubtitle(preferred.lan);
+            }).then(data => {
+                if (!data || !(data.body instanceof Array)) return;
+                _lastSubBody = data.body;
+                const text = data.body.map(item => (item.content || '').split('\n')[0].trim() + '，').join('\r\n');
+                this._copyTextToClipboard(text, '字幕已复制到剪贴板');
+            }).catch(e => {
+                console.error('复制字幕失败', e);
+                showToast('复制失败：' + (e && e.message || e), 2500);
+            });
+        },
+
+        // 剪贴板复制辅助：navigator.clipboard 优先，失败 fallback 到 textarea + execCommand
+        _copyTextToClipboard(text, successMsg) {
+            if (!text) { showToast('暂无字幕数据', 2000); return; }
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(() => {
+                    showToast(successMsg, 2000);
+                }).catch(() => this._copyViaTextarea(text, successMsg));
+            } else {
+                this._copyViaTextarea(text, successMsg);
+            }
+        },
+        _copyViaTextarea(text, successMsg) {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.cssText = 'position:fixed;opacity:0;left:-9999px;top:0;';
+            document.body.appendChild(ta);
+            ta.focus();
+            ta.select();
+            try {
+                document.execCommand('copy');
+                showToast(successMsg, 2000);
+            } catch (e) {
+                showToast('复制失败，请手动复制', 2500);
+            }
+            ta.remove();
+        },
+
+        // 字幕遮挡工具：点击切换显示/隐藏遮挡框
+        // 仅 /video/ 和 /list/watchlater 路径触发；遮挡框支持拖拽移动 + 右下角缩放 + 全屏环境适配
+        // 移植参考脚本 B站字幕遮挡工具-第二语言学习(Subtitle-Overlay) v1.3 核心逻辑
+        toggleSubtitleMask() {
+            let rect = document.getElementById('bili-subtitle-mask-rect');
+            if (rect) {
+                rect.remove();
+                return;
+            }
+            const getFsEl = () => document.fullscreenElement || document.mozFullScreenElement || document.webkitFullscreenElement || document.msFullscreenElement;
+            const fs = getFsEl();
+            const mount = fs || document.body;
+
+            rect = document.createElement('div');
+            rect.id = 'bili-subtitle-mask-rect';
+            // 尝试定位到视频中心（200×200 默认尺寸）
+            const video = document.querySelector('video');
+            const w = 200, h = 200;
+            let left, top;
+            if (video && video.videoWidth > 0) {
+                const r = video.getBoundingClientRect();
+                left = r.left + (r.width - w) / 2;
+                top = r.top + (r.height - h) / 2;
+            } else {
+                // 取不到视频时退回视口中心
+                left = (window.innerWidth - w) / 2;
+                top = (window.innerHeight - h) / 2;
+            }
+            rect.style.cssText = `position:fixed;z-index:9999;left:${left}px;top:${top}px;width:${w}px;height:${h}px;background:rgba(255,255,255,0.2);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);cursor:move;clip-path:polygon(0% 0%,100% 0%,100% calc(100% - 10px),calc(100% - 10px) 100%,0% 100%);`;
+            mount.appendChild(rect);
+
+            // 缩放手柄（右下角 40×40 透明圆，原脚本同尺寸）
+            const handle = document.createElement('div');
+            handle.style.cssText = 'width:40px;height:40px;background:rgba(255,255,255,0);border-radius:50%;position:absolute;cursor:se-resize;z-index:10000;right:-5px;bottom:-5px;';
+            rect.appendChild(handle);
+
+            let isMoving = false, isResizing = false;
+            let lastX = 0, lastY = 0;
+            rect.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                if (e.target === rect) isMoving = true;
+                else isResizing = true;
+                lastX = e.clientX; lastY = e.clientY;
+            });
+            const onMove = (e) => {
+                if (isMoving) {
+                    rect.style.left = (rect.offsetLeft - lastX + e.clientX) + 'px';
+                    rect.style.top = (rect.offsetTop - lastY + e.clientY) + 'px';
+                    lastX = e.clientX; lastY = e.clientY;
+                }
+                if (isResizing) {
+                    rect.style.width = (rect.offsetWidth + e.clientX - lastX) + 'px';
+                    rect.style.height = (rect.offsetHeight + e.clientY - lastY) + 'px';
+                    lastX = e.clientX; lastY = e.clientY;
+                }
+            };
+            const onUp = () => { isMoving = false; isResizing = false; };
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+
+            // 全屏切换时把遮挡框重新挂到全屏容器
+            const onFsChange = () => {
+                const newFs = getFsEl();
+                const newMount = newFs || document.body;
+                if (rect.parentElement !== newMount) {
+                    newMount.appendChild(rect);
+                }
+            };
+            document.addEventListener('fullscreenchange', onFsChange);
+            document.addEventListener('webkitfullscreenchange', onFsChange);
+            document.addEventListener('mozfullscreenchange', onFsChange);
+            // 遮挡框移除时同步解绑监听
+            const cleanup = new MutationObserver(() => {
+                if (!document.body.contains(rect)) {
+                    document.removeEventListener('mousemove', onMove);
+                    document.removeEventListener('mouseup', onUp);
+                    document.removeEventListener('fullscreenchange', onFsChange);
+                    document.removeEventListener('webkitfullscreenchange', onFsChange);
+                    document.removeEventListener('mozfullscreenchange', onFsChange);
+                    cleanup.disconnect();
+                }
+            });
+            cleanup.observe(document.body, { childList: true, subtree: true });
+        },
+
+        // 截图按钮现已统一走浮窗（见 addButtons 里 #screenshot-btn），此函数已废弃保留空壳
+        injectScreenshotButton() {},
+
         // 使用原生 API 下载视频（自动合并音视频）
         async biliVideoDownload() {
             if (this._downloading) {
@@ -1660,7 +2059,7 @@
             try {
                 let playurl, title, dataKey;
 
-                if (location.pathname.startsWith('/video/')) {
+                if (location.pathname.startsWith('/video/') || location.pathname.startsWith('/list/watchlater')) {
                     const videoData = this.window.__INITIAL_STATE__?.videoData;
                     title = videoData?.title || document.title;
                     playurl = `x/player/playurl?avid=${this.aid}&cid=${this.cid}`;
@@ -1791,6 +2190,23 @@
                 clearInterval(this.buttonCheckInterval);
                 this.buttonCheckInterval = null;
             }
+
+            // 清除残留的浮动浮窗容器（B 站 Vue 不会清这个，SPA 跳转后必须手动清，否则 addButtons 以为按钮还在）
+            const oldFloatBar = document.getElementById('bili-viewer-floatbar');
+            if (oldFloatBar) oldFloatBar.remove();
+
+            // 取消浮窗跟踪 rAF 循环（防止 SPA 跳转后旧循环跟新循环冲突）
+            if (this._trackRafId) {
+                cancelAnimationFrame(this._trackRafId);
+                this._trackRafId = null;
+            }
+
+            // 清除残留的旧截图按钮（曾注入在播放器控制栏，新版本已统一走浮窗，清理历史残留）
+            const oldShotBtn = document.getElementById('bili-screenshot-inject');
+            if (oldShotBtn) oldShotBtn.remove();
+            // 清除残留的字幕遮挡框（SPA 跳转后旧遮挡框不能跟到新视频，手动清）
+            const oldMask = document.getElementById('bili-subtitle-mask-rect');
+            if (oldMask) oldMask.remove();
         },
 
         // 启动定时检查按钮是否存在
@@ -1802,8 +2218,11 @@
 
             // 每2秒检查一次按钮是否存在
             this.buttonCheckInterval = setInterval(() => {
-                if (!elements.getAs('#subtitle-viewer-btn') || !elements.getAs('#cover-viewer-btn') || !elements.getAs('#download-video-btn')) {
-                    console.log('按钮已消失，重新添加');
+                const isVideoPath = location.pathname.startsWith('/video/') || location.pathname.startsWith('/list/watchlater');
+            // 截图/字幕遮挡所有路径都在浮窗；复制字幕/下载视频仅视频路径
+                const baseMissing = !elements.getAs('#subtitle-viewer-btn') || !elements.getAs('#cover-viewer-btn') || !elements.getAs('#screenshot-btn') || !elements.getAs('#subtitle-mask-btn')
+                    || (isVideoPath && (!elements.getAs('#download-video-btn') || !elements.getAs('#copy-subtitle-btn')));
+                if (baseMissing) {
                     this.buttonAdded = false;
                     this.addButtons();
                 }
@@ -1811,45 +2230,54 @@
         },
 
         init() {
+            // 注册 Tampermonkey 菜单里的按钮开关项（点 Tampermonkey 图标下拉可见）
+            this.setupBtnSwitchMenus();
             // 第一时间添加按钮（不等待 API 请求）
             const tryAddButtons = () => {
-                if (!elements.getAs('#subtitle-viewer-btn') || !elements.getAs('#cover-viewer-btn') || !elements.getAs('#download-video-btn')) {
+                // 浮窗按钮：封面/字幕/截图/字幕遮挡所有路径都有；复制字幕/下载视频仅视频路径
+                const isVideoPath = location.pathname.startsWith('/video/') || location.pathname.startsWith('/list/watchlater');
+                // 浮窗按钮：封面/字幕/截图/字幕遮挡所有路径都有；复制字幕/下载视频仅视频路径
+                const buttonsReady = (isVideoPath
+                    ? (!!elements.getAs('#subtitle-viewer-btn') && !!elements.getAs('#cover-viewer-btn') && !!elements.getAs('#screenshot-btn') && !!elements.getAs('#subtitle-mask-btn')
+                        && !!elements.getAs('#download-video-btn') && !!elements.getAs('#copy-subtitle-btn'))
+                    : (!!elements.getAs('#subtitle-viewer-btn') && !!elements.getAs('#cover-viewer-btn') && !!elements.getAs('#screenshot-btn') && !!elements.getAs('#subtitle-mask-btn')));
+                if (!buttonsReady) {
                     this.addButtons();
                 }
             };
             tryAddButtons();
 
-            // DOM 未就绪时等待 DOMContentLoaded
-            if (document.readyState === 'loading') {
-                document.addEventListener('DOMContentLoaded', tryAddButtons);
-            }
-
             // 后台获取字幕等数据（不影响按钮显示）
             this.setupData().then(subtitle => {
-                if (!subtitle) return;
+                // 不论字幕是否拿到都启动巡检：番剧路径 setupData 常规拿不到字幕，
+                // 但 startButtonCheck 会负责补注控制栏截图按钮（B 站 Vue 重建播放器时按钮会丢）
                 tryAddButtons();
                 this.startButtonCheck();
-                console.log('B站字幕和封面查看器初始化成功');
+                if (subtitle) console.log('B站字幕和封面查看器初始化成功');
             }).catch(e => {
                 console.error('B站字幕和封面查看器初始化失败', e);
+                // 出错也要启动巡检，否则截图按钮没法自愈
+                this.startButtonCheck();
             });
 
             // 持续监听 DOM 变化，确保按钮第一时间出现（参考 Onekey.js 方案）
             let addPending = false;
             let lastUrl = location.href;
             new MutationObserver(() => {
-                // 检测 SPA 页面跳转
+                // 检测 SPA 页面跳转（B 站用 pushState 切视频，浏览器不会重新加载文档，TM 也不会重新注入脚本）
                 if (lastUrl !== location.href) {
                     lastUrl = location.href;
                     this.reset();
+                    // 立即尝试加按钮 + 1 秒后兜底（B 站 Vue 渲染可能需要时间）
+                    tryAddButtons();
                     setTimeout(() => {
                         tryAddButtons();
                         this.startButtonCheck();
                     }, 1000);
-                    return;
+                    // 不 return，继续往下检查：本次 DOM 变动也可能是新视频渲染完成
                 }
                 // 按钮不存在时尝试添加（rAF 防抖）
-                if (!elements.getAs('#subtitle-viewer-btn') || !elements.getAs('#cover-viewer-btn') || !elements.getAs('#download-video-btn')) {
+                if (!elements.getAs('#subtitle-viewer-btn') || !elements.getAs('#cover-viewer-btn') || !elements.getAs('#screenshot-btn')) {
                     if (addPending) return;
                     addPending = true;
                     requestAnimationFrame(() => {
@@ -1864,8 +2292,12 @@
         }
     };
 
-    // 初始化
-    bilibiliViewer.init();
+    // 初始化（等待 body 就绪后再启动，避免 document.body 为 null 时崩溃）
+    function whenBodyReady(fn) {
+        if (document.body) return fn();
+        document.addEventListener('DOMContentLoaded', fn, { once: true });
+    }
+    whenBodyReady(() => bilibiliViewer.init());
 
     // ═══════════════════════════════════════════
     //  Module: B站用户空间 - 批量下载视频
@@ -2495,7 +2927,7 @@
         if (info.bvid) md += '- **BV号**：' + info.bvid + '\n';
         md += '- **视频链接**：' + location.href + '\n- **导出时间**：' + new Date().toLocaleString('zh-CN') + '\n\n';
         md += '## 热门评论\n\n';
-        top.forEach(function(c, i) { md += (i+1) + '. **' + c.name + '** (??' + c.like + ')：' + escMD(c.text) + '\n'; });
+        top.forEach(function(c, i) { md += (i+1) + '. **' + c.name + '** (👍' + c.like + ')：' + escMD(c.text) + '\n'; });
         md += '\n## 全部评论\n\n';
         comments.forEach(function(c, i) {
             md += (i+1) + '. **' + c.name + '**：' + escMD(c.text) + '\n';
@@ -2642,7 +3074,7 @@
         // 是否把关键词替换为不可点击的斜体（调试用，默认禁用）
         var changeToItalic = GM_getValue('changeToItalic', 0);
         if (typeof GM_registerMenuCommand === 'function') {
-            GM_registerMenuCommand((changeToItalic ? '[??已启用]' : '[?已禁用]') + " 将关键词替换为斜体", function() {
+            GM_registerMenuCommand((changeToItalic ? '[✔️已启用]' : '[❌已禁用]') + " 将关键词替换为斜体", function() {
                 GM_setValue('changeToItalic', !changeToItalic);
                 alert('修改成功, 刷新页面后生效');
             });
@@ -2651,7 +3083,7 @@
         // 是否适配 "Bilibili 翻页评论区" 脚本
         var fanye = GM_getValue('fanye', 0);
         if (typeof GM_registerMenuCommand === 'function') {
-            GM_registerMenuCommand((fanye ? '[??已启用]' : '[?已禁用]') + " 兼容脚本 \"Bilibili 翻页评论区\"", function() {
+            GM_registerMenuCommand((fanye ? '[✔️已启用]' : '[❌已禁用]') + " 兼容脚本 \"Bilibili 翻页评论区\"", function() {
                 GM_setValue('fanye', !fanye);
                 alert('修改成功, 刷新页面后生效');
             });
