@@ -7,7 +7,7 @@
 // @description:en     Enhanced Features: View Cover, Download Subtitles(SRT/TXT), Download Danmaku(XML/ASS), Download Comments, Download Video(4K、8K Support), Video Screenshot, AI Subtitle Summary, Cool Video Download, User Space Batch Download, Personal Favorites Batch Download.
 // @namespace          https://www.runningcheese.com/userscripts
 // @author             阿虚同学（原作者：RunningCheese）
-// @version            3.15
+// @version            3.16
 // @match              http*://www.bilibili.com/video/*
 // @match              http*://www.bilibili.com/bangumi/*
 // @match              http*://www.bilibili.com/list/*
@@ -83,14 +83,16 @@
             input.dispatchEvent(new Event('change', { bubbles: true }));
             return;
         }
-        // contenteditable 元素（用 insertHTML + <br> 确保换行正确渲染）
+        // contenteditable 元素（ProseMirror 等编辑器只认 paste 输入通道，直接改 DOM 会被回滚）
         input.focus();
-        window.getSelection().removeAllRanges();
-        var range = document.createRange();
-        range.selectNodeContents(input);
-        window.getSelection().addRange(range);
-        var html = prompt.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
-        document.execCommand('insertHTML', false, html);
+        var dt = new DataTransfer();
+        dt.setData('text/plain', prompt);
+        input.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+        // 兜底：paste 被拦截时退回 insertText
+        if (!input.textContent || !input.textContent.trim()) {
+            document.execCommand('selectAll', false, null);
+            document.execCommand('insertText', false, prompt);
+        }
     }
 
     // 查找 AI 发送按钮
@@ -125,6 +127,10 @@
         doubao: [
             '[data-testid="chat_input_input"]',
             'div[contenteditable="true"][data-testid="chat_input_input"]',
+            'div[contenteditable="true"]',
+            'textarea[placeholder]'
+        ],
+        qianwen: [
             'div[contenteditable="true"]',
             'textarea[placeholder]'
         ],
@@ -1749,16 +1755,36 @@
     const select = document.getElementById('subtitle-title');
     const prevValue = select.value;
 
-    // 填充下拉选项
-    select.innerHTML = '';
+    // 无缓存数据时先主动拉取（与复制字幕按钮对齐，避免误报"无AI字幕"）
     if (!this.subtitle || this.subtitle.count === 0) {
-        const opt = document.createElement('option');
-        opt.value = '';
-        opt.textContent = '无字幕';
-        select.appendChild(opt);
-        subtitleContent.innerHTML = '当前视频无AI字幕，可以下载视频后使用一键本地视频转文字工具，将转写的 txt 文件扔给AI大模型总结：<a href="https://mp.weixin.qq.com/s/MG91O-vX0x2BvfsSCFJWSA" target="_blank" contenteditable="false" style="color:#39ADE7;text-decoration:underline;cursor:pointer;">查看教程</a>';
+        subtitleContent.textContent = '正在加载字幕...';
+        this.setupData().then(sub => {
+            // 拉取成功且有字幕 → 重新走一遍完整渲染（此时 this.subtitle 已填充）
+            if (sub && sub.count > 0) {
+                this.showSubtitleInPanel();
+                return;
+            }
+            // 确认无字幕再显示提示
+            select.innerHTML = '';
+            const opt = document.createElement('option');
+            opt.value = '';
+            opt.textContent = '无字幕';
+            select.appendChild(opt);
+            subtitleContent.innerHTML = '当前视频无AI字幕，可以下载视频后使用一键本地视频转文字工具，将转写的 txt 文件扔给AI大模型总结：<a href="https://mp.weixin.qq.com/s/MG91O-vX0x2BvfsSCFJWSA" target="_blank" contenteditable="false" style="color:#39ADE7;text-decoration:underline;cursor:pointer;">查看教程</a>';
+        }).catch(() => {
+            // setupData 失败（接口错误等）也显示无字幕提示，保持原行为
+            select.innerHTML = '';
+            const opt = document.createElement('option');
+            opt.value = '';
+            opt.textContent = '无字幕';
+            select.appendChild(opt);
+            subtitleContent.innerHTML = '当前视频无AI字幕，可以下载视频后使用一键本地视频转文字工具，将转写的 txt 文件扔给AI大模型总结：<a href="https://mp.weixin.qq.com/s/MG91O-vX0x2BvfsSCFJWSA" target="_blank" contenteditable="false" style="color:#39ADE7;text-decoration:underline;cursor:pointer;">查看教程</a>';
+        });
         return;
     }
+
+    // 填充下拉选项
+    select.innerHTML = '';
     this.subtitle.subtitles.forEach(sub => {
         const opt = document.createElement('option');
         opt.value = sub.lan;
@@ -2273,6 +2299,8 @@
                     setTimeout(() => {
                         tryAddButtons();
                         this.startButtonCheck();
+                        // reset() 已清空 subtitle 缓存，主动预拉取，避免"获取字幕"按钮误报无字幕
+                        this.setupData().catch(() => {});
                     }, 1000);
                     // 不 return，继续往下检查：本次 DOM 变动也可能是新视频渲染完成
                 }
@@ -2728,7 +2756,15 @@
                 tb.id = 'bili-toolbar';
                 const label = S.enabled ? '停用下载' : '启用下载';
                 const cls = S.enabled ? ' bili-tb-on' : '';
-                tb.innerHTML = '<button id="bili-toggle" class="bili-tb-btn' + cls + '">' + label + '</button><button id="bili-sel-all" class="bili-tb-btn" disabled>全选</button><button id="bili-invert" class="bili-tb-btn" disabled>反选</button><span id="bili-count" class="bili-tb-count">已选 0 项</span><button id="bili-dl-btn" class="bili-tb-btn" disabled>下载选中</button>';
+                tb.innerHTML = '<div class="bili-tb-row">'
+                    + '<button id="bili-toggle" class="bili-tb-btn' + cls + '">' + label + '</button>'
+                    + '<button id="bili-sel-all" class="bili-tb-btn" disabled>全选</button>'
+                    + '<button id="bili-invert" class="bili-tb-btn" disabled>反选</button>'
+                    + '</div>'
+                    + '<div class="bili-tb-row">'
+                    + '<span id="bili-count" class="bili-tb-count">已选 0 项</span>'
+                    + '<button id="bili-dl-btn" class="bili-tb-btn" disabled>下载选中</button>'
+                    + '</div>';
 
                 const styleEl = document.createElement('style');
                 styleEl.textContent = `
@@ -2765,19 +2801,25 @@
                     #bili-toolbar {
                         position: fixed;
                         bottom: 20px;
-                        left: 50%;
-                        transform: translateX(-50%);
+                        right: 20px;
                         z-index: 2147483646;
                         display: flex;
+                        flex-direction: column;
                         align-items: center;
                         gap: 10px;
-                        padding: 10px 18px;
+                        padding: 12px;
                         background: rgba(0,0,0,0.65);
                         backdrop-filter: blur(16px);
                         -webkit-backdrop-filter: blur(16px);
-                        border-radius: 20px;
+                        border-radius: 12px;
                         box-shadow: 0 4px 20px rgba(0,0,0,0.35);
                         border: 1px solid #444;
+                    }
+                    .bili-tb-row {
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        gap: 8px;
                     }
                     .bili-tb-btn {
                         height: 32px;
